@@ -37,7 +37,8 @@ class SFT_with_LoRA:
         model = Gemma3ForConditionalGeneration.from_pretrained(
             self.model_name,
             quantization_config = bnb_config,
-            device_map="auto"
+            device_map="auto",
+            use_fast=True
         )
 
         return model, processor
@@ -111,7 +112,7 @@ class SFT_with_LoRA:
             tf32=True,
             hub_private_repo=False,
             push_to_hub=False,
-            num_train_epochs=5,
+            num_train_epochs=4,
             gradient_checkpointing=True,
             gradient_checkpointing_kwargs={"use_reentrant": False},
             packing=False,
