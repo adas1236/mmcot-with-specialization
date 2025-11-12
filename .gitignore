@@ -11,3 +11,7 @@ wheels/
 
 # SLURM Scripts
 run_slurm.sh
+
+# Large
+models
+data

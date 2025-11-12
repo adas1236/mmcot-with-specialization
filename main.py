@@ -1,12 +1,11 @@
-import torch
+from datasets import load_from_disk
+from code.preprocess import PreprocessDataset
+from code.finetune import SFT_with_LoRA
 
 def main():
-    print("Hello from mmcot-with-specialization!")
-    print(torch.version.cuda)
-    print(torch.cuda.is_available())
-    print(torch.cuda.device_count())
-    print(torch.cuda.current_device())
-    print(torch.cuda.get_device_name(0))
+    DATASET_NAME = "derek-thomas/ScienceQA"
+    pd = PreprocessDataset(dataset_name=DATASET_NAME)
+    pd.preprocess_dataset()
 
 if __name__ == "__main__":
     main()
