@@ -38,7 +38,6 @@ class SFT_with_LoRA:
             self.model_name,
             quantization_config = bnb_config,
             device_map="auto",
-            use_fast=True
         )
 
         return model, processor
