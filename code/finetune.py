@@ -1,20 +1,12 @@
-from enum import Enum
-from functools import partial
-import polars as pl
 import torch
-import json
 import os, sys
-from PIL import Image
-from io import BytesIO
 
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer, TrainingArguments, BitsAndBytesConfig, Gemma3ForConditionalGeneration, set_seed
-from datasets import load_dataset, DatasetDict, Dataset, load_from_disk
+from transformers import AutoProcessor, BitsAndBytesConfig, Gemma3ForConditionalGeneration
+from datasets import load_from_disk
 from trl import SFTConfig, SFTTrainer
 from peft import LoraConfig, TaskType, get_peft_model
-from tqdm import tqdm
-from dataclasses import dataclass
-from PIL import Image
-from accelerate import dispatch_model, infer_auto_device_map
+import wandb
+import time
 
 import logging
 logging.basicConfig(filename="../logs/collate_errors.log", level=logging.WARNING)
@@ -32,7 +24,7 @@ class SFT_with_LoRA:
     def load_model(self):
         processor = AutoProcessor.from_pretrained(self.model_name, use_fast = True)
         bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
+            load_in_8bit=True,
         )
         model = Gemma3ForConditionalGeneration.from_pretrained(
             self.model_name,
@@ -91,21 +83,31 @@ class SFT_with_LoRA:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+        wandb.init(
+            project=f"{self.model_name.replace('/', '-')}-lora-sft",
+            name=f"{self.model_name.replace('/', '-')}-SFT-{time.time()}",
+            save_code=True,
+            mode="offline"
+        )
+
         training_args = SFTConfig(
             output_dir=f"../models/{self.model_name}-finetuned",
+            logging_dir=f"../logs/tensorboard",
             per_device_train_batch_size=1,
             per_device_eval_batch_size=2,
             gradient_accumulation_steps=4,
             save_strategy="epoch",
-            save_total_limit=2,
-            eval_strategy="no",
-            logging_steps=200,
+            save_total_limit=3,
+            eval_strategy="steps",
+            eval_steps=1000,
+            logging_steps=10,
+            logging_first_step=True,
             learning_rate=1e-4,
             max_grad_norm=1.0,
             weight_decay=0.1,
             warmup_ratio=0.1,
             lr_scheduler_type="cosine",
-            report_to="tensorboard",
+            report_to=["tensorboard", "wandb"],
             bf16=False,
             fp16=True,
             tf32=True,
@@ -142,6 +144,13 @@ class SFT_with_LoRA:
         trainer.train()
         trainer.save_model()
 
+        valid_metrics = trainer.evaluate(self.dataset["validation"])
+        print("Valid metrics:", valid_metrics)
+        wandb.log({"valid": valid_metrics})
+
+        test_metrics = trainer.evaluate(self.dataset["test"])
+        print("Test metrics:", test_metrics)
+        wandb.log({"test": test_metrics})
 
 if __name__ == "__main__":
     trainer = SFT_with_LoRA(
