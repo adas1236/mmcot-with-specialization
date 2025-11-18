@@ -1,22 +1,22 @@
 import json
 import torch
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 import os
 import sys
 import polars as pl
 import re
 from tqdm import tqdm
 import gc
+import argparse
 
 from PIL.Image import Image
 from typing import List
 
 CACHE_DIR = "/fs/nexus-scratch/adas1236/.cache/huggingface"
-torch.backends.cudnn.benchmark = True
 
 os.environ["HF_HOME"] = CACHE_DIR
-os.environ["TRANSFORMERS_CACHE"] = CACHE_DIR
+# os.environ["TRANSFORMERS_CACHE"] = CACHE_DIR
 os.environ["HF_HUB_CACHE"] = CACHE_DIR
 os.environ["HF_DATASETS_CACHE"] = CACHE_DIR
 os.environ["XDG_CACHE_HOME"] = CACHE_DIR
@@ -47,8 +47,16 @@ class LabelThoughts:
         self.load_data()
         self.load_model()
 
-    def load_data(self):
-        self.dataset = load_dataset(self.dataset_name, "Scientific Reasoning - Physics", cache_dir=f"../data/raw/{self.dataset_name}")
+    def load_data(self, seed=42):
+        dataset = load_dataset(self.dataset_name, "Scientific Reasoning - Physics", cache_dir=f"../data/raw/{self.dataset_name}")['train']
+
+        split = dataset.train_test_split(test_size=0.2, seed=seed)
+        self.dataset = DatasetDict({
+            "train": split['train'],
+            "test": split['test']
+        })
+        print(self.dataset['train'])
+        sys.exit()
 
     def load_model(self):
         self.processor: Qwen3VLProcessor = AutoProcessor.from_pretrained(
@@ -57,13 +65,12 @@ class LabelThoughts:
         )
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_name,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             device_map="auto",
             attn_implementation="sdpa",
             cache_dir=self.cache_dir
         )
         self.tokenizer = self.processor.tokenizer
-        self.model.eval()
 
     def split_outside_and_get_numbers(self, data: str):
         pattern = r"<image_start>\[(problem|reasoning)_image_(\d+)\]<image_end>"
@@ -158,20 +165,16 @@ class LabelThoughts:
 
         return messages
     
-    def annotate_batch(self, batch, indices):
-        messages_batch = []
-        for i in range(len(indices)):
-            messages_batch.append(
-                self.build_prompt(
-                    batch['Question'][i],
-                    batch['Text Reasoning Trace'][i],
-                    question_imgs=[batch[f'problem_image_{j + 1}'][i] for j in range(2)],
-                    reasoning_imgs=[batch[f'reasoning_image_{j + 1}'][i] for j in range(4)]
+    def annotate_sample(self, sample):
+        message = self.build_prompt(
+                    sample['Question'],
+                    sample['Text Reasoning Trace'],
+                    question_imgs=[sample[f'problem_image_{j + 1}'] for j in range(2)],
+                    reasoning_imgs=[sample[f'reasoning_image_{j + 1}'] for j in range(4)]
                 )
-            )
         
         inputs = self.processor.apply_chat_template(
-            messages_batch,
+            message,
             tokenize=True,
             add_generation_prompt=True,
             return_dict=True,
@@ -182,7 +185,7 @@ class LabelThoughts:
 
         inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
 
-        with torch.inference_mode(), torch.amp.autocast(self.model.device.type):
+        with torch.inference_mode(), torch.amp.autocast(device_type=self.model.device.type):
             generated = self.model.generate(
                 **inputs,
                 max_new_tokens=256,
@@ -192,82 +195,90 @@ class LabelThoughts:
                 use_cache=True
             )
 
-        batch_labels = []
-
-        for i, res in enumerate(generated):
-            out = self.processor.decode(res, skip_special_tokens=True)
-            out_messages = out.split("assistant")
-            out = out_messages[-1]
-            try:
-                parsed = json.loads(out)
-                thought_labels = [step['label'] for step in parsed]
-            except Exception as e:
-                print("Raw output", out)
-                thought_labels = ['unparseable']
+        out = self.processor.decode(generated[0], skip_special_tokens=True)
+        out_messages = out.split("assistant")
+        out = out_messages[-1]
+        try:
+            parsed = json.loads(out)
+            thought_labels = [step['label'] for step in parsed]
+        except Exception as e:
+            print("Raw output", out)
+            thought_labels = ['unparseable']
             
-            batch_labels.append(thought_labels)
 
         del inputs, generated
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
         
-        return batch_labels
+        return thought_labels
     
     def annotate_dataset(self, output_file="../data/thought_labels.parquet", 
-                        batch_size=4, save_interval=96):
+                        save_interval=96, start_idx = 0, end_idx = None):
         
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-        
-        if os.path.exists(output_file):
-            df_existing = pl.scan_parquet(output_file).select(['sample_index', 'thought_labels'])
-            start_idx = df_existing.select(pl.col('sample_index').max()).collect().item() + 1
-            all_results = df_existing.collect().to_dicts()
-            print(f"Resuming from sample {start_idx}")
-        else:
-            start_idx = 0
-            all_results = []
 
+        all_results = []
+        
         dataset_size = len(self.dataset['train'])
+        if end_idx is None:
+            end_idx = dataset_size
+        end_idx = min(dataset_size, end_idx)
         
         pbar = tqdm(
-            range(start_idx, dataset_size, batch_size), 
-            desc="Annotating",
-            initial=start_idx // batch_size,
-            total=(dataset_size + batch_size - 1) // batch_size
+            range(start_idx, end_idx), 
+            desc=f"Annotating {start_idx}-{end_idx}",
+            initial=start_idx,
+            total=end_idx - start_idx
         )
 
-        for batch_start in pbar:
-            batch_end = min(batch_start + batch_size, dataset_size)
-            actual_batch_size = batch_end - batch_start
+        for idx in pbar:
+            sample = self.dataset['train'][idx]
             
-            batch_samples = self.dataset['train'][batch_start:batch_end]
-            batch_indices = list(range(batch_start, batch_end))
+            thought_labels = self.annotate_sample(sample)
             
-            batch_results = self.annotate_batch(batch_samples, indices=batch_indices)
-            
-            for i, thought_labels in enumerate(batch_results):
-                all_results.append({
-                    "sample_index": batch_start + i,
-                    "thought_labels": thought_labels
-                })
+            all_results.append({
+                "sample_index": idx,
+                "thought_labels": thought_labels
+            })
 
-            if (len(all_results) - start_idx) % save_interval < actual_batch_size or batch_end >= dataset_size:
+            if len(all_results) % save_interval == 0:
                 df = pl.DataFrame(all_results)
                 df.write_parquet(output_file)
-                pbar.set_postfix({"last_saved": batch_end})
+                pbar.set_postfix({"last_saved": idx})
                 
                 # Periodic garbage collection
                 gc.collect()
 
+        df = pl.DataFrame(all_results)
+        df.write_parquet(output_file)
+        gc.collect()
+
         print(f"Annotation complete. Total samples: {len(all_results)}")
 
-
 def main():
-    lt = LabelThoughts()
-    lt.annotate_dataset()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--dataset_name", default="multimodal-reasoning-lab/Zebra-CoT")
+    parser.add_argument("--cache_dir", default=CACHE_DIR)
+    parser.add_argument("--output_prefix", default="../data/thought_labels")
+    parser.add_argument("--save_interval", type=int, default=96)
+    parser.add_argument("--start_idx", type=int, default=0)
+    parser.add_argument("--end_idx", type=int, default=1)
 
-if __name__ == '__main__':
+    args = parser.parse_args()
+
+    lt = LabelThoughts(
+        model_name=args.model_name,
+        dataset_name=args.dataset_name,
+        cache_dir=args.cache_dir
+    )
+    lt.annotate_dataset(
+        output_file=f"{args.output_prefix}.parquet",
+        save_interval=args.save_interval
+    )
+
+
+if __name__ == "__main__":
     main()
-
 

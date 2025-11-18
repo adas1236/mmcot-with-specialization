@@ -10,7 +10,7 @@ wheels/
 .venv
 
 # SLURM Scripts
-run_slurm.sh
+run_annotate_thoughts.sh
 
 # Large
 models
